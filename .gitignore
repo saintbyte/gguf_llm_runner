@@ -27,6 +27,17 @@ go.work.sum
 # env file
 .env
 
+# Собранный бинарник
+/bin/
+
+# Модели (скачиваются через `make download-model`)
+/models/*.gguf
+/models/*.gguf.part
+
+# Локальный клон и артефакты сборки llama-go
+/third_party/
+/third_party/llama-go/build/
+
 # Editor/IDE
 # .idea/
 # .vscode/
