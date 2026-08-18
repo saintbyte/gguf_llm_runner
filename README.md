@@ -34,6 +34,9 @@ make run              # запускает интерактивный чат
 # Классический построчный интерактив без TUI (для pipe/не-TTY)
 ./bin/gguf_llm_runner -tui=false
 
+# Без инструментов (function calling отключён)
+./bin/gguf_llm_runner -tools=false
+
 # С LoRA-адаптером (применяется к контексту)
 ./bin/gguf_llm_runner -lora models/my-adapter.gguf -lora-scale 0.8
 
@@ -77,6 +80,21 @@ make run              # запускает интерактивный чат
 | `-lora` | — | Путь к LoRA-адаптеру (`.gguf`), применяется к контексту |
 | `-lora-scale` | `1.0` | Масштаб LoRA-адаптера |
 | `-debug` | `false` | Отладка (лог llama.cpp, промпт перед каждым ходом) |
+| `-tools` | `true` | Function calling (инструменты: get_weather) |
+
+### Function Calling
+
+Модель может вызывать инструменты для получения данных. Встроенный инструмент:
+
+- **`get_weather(location)`** — всегда возвращает `"На Дерибасовская хорошая погода"`
+
+При запросе погоды модель автоматически вызовет инструмент и вернёт результат. Пример:
+
+```bash
+./bin/gguf_llm_runner -message "Какая погода на Дерибасовской?"
+```
+
+В TUI tool calls отображаются значком 🔧 (вызов) и 📋 (результат). Чтобы добавить свои инструменты, создайте реестр через `llmtools.NewRegistry()` и зарегистрируйте функции через `registry.Register(tool, fn)`.
 
 ## Сборка из исходников llama-go
 
@@ -102,6 +120,7 @@ GPU-сборки: см. [building.md](https://github.com/tcpipuk/llama-go/blob/m
 cmd/gguf_llm_runner/   точка входа CLI
 internal/llmadapter/   загрузка и применение LoRA (cgo-шим llama.cpp)
 internal/llmcli/       стриминг-рендерер (обработка <think>) и построчный режим
+internal/llmtools/     инструменты (function calling): реестр, парсер, get_weather
 internal/tui/          TUI-чат на bubbletea
 scripts/               обёртки над Makefile
 models/                скачанные модели (в git не коммитятся)

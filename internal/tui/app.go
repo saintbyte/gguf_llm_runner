@@ -15,6 +15,7 @@ import (
 	llama "github.com/tcpipuk/llama-go"
 
 	"github.com/saintbyte/gguf_llm_runner/internal/llmcli"
+	"github.com/saintbyte/gguf_llm_runner/internal/llmtools"
 )
 
 type status int
@@ -22,15 +23,18 @@ type status int
 const (
 	statusIdle status = iota
 	statusGenerating
+	statusToolCall
 )
 
 // entry — сообщение в переписке для отображения.
 type entry struct {
-	role      string // "user" | "assistant" | "system"
+	role      string // "user" | "assistant" | "system" | "tool_call" | "tool_result"
 	content   string
 	thinking  string
 	streaming bool
 	stats     string // статистика генерации ответа (если есть)
+	toolName  string // имя инструмента (для role=tool_call)
+	toolArgs  string // аргументы (для role=tool_call)
 }
 
 // deltaMsg — очередной фрагмент ответа от генерации.
@@ -59,6 +63,7 @@ type Config struct {
 	GPULayers    int     // слоёв на GPU (для шапки; -1 = все)
 	LoraPath     string  // путь к LoRA-адаптеру (для шапки)
 	LoraScale    float32 // масштаб LoRA
+	ToolRegistry *llmtools.Registry // реестр инструментов (nil = без tools)
 }
 
 // Model — Bubble Tea модель чата.
@@ -225,8 +230,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.listenCmd()
 
 	case genDoneMsg:
-		m.finalize(msg.err)
-		return m, nil
+		cmd := m.finalize(msg.err)
+		return m, cmd
 
 	case spinner.TickMsg:
 		m.spinner, cmd = m.spinner.Update(msg)
@@ -336,6 +341,8 @@ func (m *Model) footer() string {
 			s += " | " + hint
 		}
 		return s
+	case statusToolCall:
+		return m.spinner.View() + " выполнение инструмента..."
 	default:
 		s := m.key("Enter") + " отправить | " + m.key("Tab") + " прокрутка | " +
 			m.key("/clear") + " сброс | " + m.key("/help") + " | " +
@@ -513,7 +520,7 @@ func (m *Model) appendDelta(d deltaMsg) {
 	m.refreshViewport()
 }
 
-func (m *Model) finalize(err error) {
+func (m *Model) finalize(err error) tea.Cmd {
 	if m.genCancel != nil {
 		m.genCancel()
 		m.genCancel = nil
@@ -538,13 +545,80 @@ func (m *Model) finalize(err error) {
 			msg = "(генерация прервана)"
 		}
 		m.entries = append(m.entries, entry{role: "system", content: msg})
-	} else if !m.cancelled && idx >= 0 {
+		m.cancelled = false
+		m.status = statusIdle
+		m.refreshViewport()
+		return nil
+	}
+
+	if m.cancelled {
+		m.cancelled = false
+		m.status = statusIdle
+		m.refreshViewport()
+		return nil
+	}
+
+	if idx >= 0 && m.cfg.ToolRegistry != nil && llmtools.IsToolCallResponse(m.entries[idx].content) {
+		return m.handleToolCalls(m.entries[idx].content)
+	}
+
+	if idx >= 0 {
 		m.messages = append(m.messages, llama.ChatMessage{Role: "assistant", Content: m.entries[idx].content})
 	}
 
-	m.cancelled = false
 	m.status = statusIdle
 	m.refreshViewport()
+	return nil
+}
+
+func (m *Model) handleToolCalls(content string) tea.Cmd {
+	calls := llmtools.ParseToolCalls(content)
+	if len(calls) == 0 {
+		m.messages = append(m.messages, llama.ChatMessage{Role: "assistant", Content: content})
+		m.status = statusIdle
+		m.refreshViewport()
+		return nil
+	}
+
+	nonTool := llmtools.ExtractNonToolContent(content)
+	if nonTool != "" {
+		m.entries[len(m.entries)-1].content = nonTool
+	} else {
+		m.entries[len(m.entries)-1].content = ""
+	}
+	m.messages = append(m.messages, llama.ChatMessage{Role: "assistant", Content: content})
+
+	for _, call := range calls {
+		argsStr := fmt.Sprintf("%v", call.Arguments)
+		m.entries = append(m.entries, entry{
+			role:     "tool_call",
+			toolName: call.Name,
+			toolArgs: argsStr,
+			content:  fmt.Sprintf("Вызов %s(%v)", call.Name, call.Arguments),
+		})
+		m.refreshViewport()
+
+		result, err := m.cfg.ToolRegistry.Invoke(call.Name, call.Arguments)
+		if err != nil {
+			result = fmt.Sprintf("Error: %v", err)
+		}
+		m.entries = append(m.entries, entry{
+			role:    "tool_result",
+			content: result,
+		})
+		m.messages = append(m.messages, llama.ChatMessage{Role: "tool", Content: llmtools.FormatToolResult(call, result, err)})
+		m.refreshViewport()
+	}
+
+	m.splitter = llmcli.ThinkSplitter{}
+	m.cancelled = false
+	m.genStarted = time.Now()
+	m.genTokens = 0
+	m.entries = append(m.entries, entry{role: "assistant", streaming: true})
+	m.status = statusGenerating
+	m.refreshViewport()
+
+	return tea.Batch(m.startGeneration(), m.spinner.Tick)
 }
 
 // runStats — статистика последней генерации: токены, скорость, время, контекст.
@@ -594,6 +668,16 @@ func (m *Model) renderContent() string {
 			}
 			b.WriteString("\n\n")
 
+		case "tool_call":
+			b.WriteString("\n")
+			b.WriteString(m.toolCallStyle().Render(fmt.Sprintf("🔧 %s", e.content)))
+			b.WriteString("\n\n")
+
+		case "tool_result":
+			b.WriteString("\n")
+			b.WriteString(m.toolResultStyle().Render(fmt.Sprintf("📋 %s", e.content)))
+			b.WriteString("\n\n")
+
 		case "system":
 			b.WriteString("\n")
 			b.WriteString(m.sysStyle.Render(e.content))
@@ -601,6 +685,14 @@ func (m *Model) renderContent() string {
 		}
 	}
 	return b.String()
+}
+
+func (m *Model) toolCallStyle() lipgloss.Style {
+	return lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Italic(true)
+}
+
+func (m *Model) toolResultStyle() lipgloss.Style {
+	return lipgloss.NewStyle().Foreground(lipgloss.Color("77"))
 }
 
 func (m *Model) refreshViewport() {

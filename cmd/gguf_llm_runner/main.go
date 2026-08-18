@@ -19,6 +19,7 @@ import (
 
 	"github.com/saintbyte/gguf_llm_runner/internal/llmadapter"
 	"github.com/saintbyte/gguf_llm_runner/internal/llmcli"
+	"github.com/saintbyte/gguf_llm_runner/internal/llmtools"
 	"github.com/saintbyte/gguf_llm_runner/internal/tui"
 )
 
@@ -41,6 +42,7 @@ var (
 	loraPath    = flag.String("lora", "", "путь к LoRA-адаптеру (.gguf), применяется к контексту")
 	loraScale   = flag.Float64("lora-scale", 1.0, "масштаб LoRA-адаптера")
 	debug       = flag.Bool("debug", false, "показывать историю и отладочный вывод llama.cpp")
+	enableTools = flag.Bool("tools", true, "включить function calling (инструменты)")
 )
 
 func main() {
@@ -52,6 +54,11 @@ func main() {
 		os.Setenv("LLAMA_LOG", "error")
 	}
 	llama.InitLogging()
+
+	toolRegistry := llmtools.NewRegistry()
+	if *enableTools {
+		llmtools.RegisterWeather(toolRegistry)
+	}
 
 	fmt.Printf("Загрузка модели: %s\n", *modelPath)
 	model, err := llama.LoadModel(*modelPath, llama.WithGPULayers(*gpuLayers))
@@ -87,12 +94,19 @@ func main() {
 	interruptCh := make(chan os.Signal, 1)
 	signal.Notify(interruptCh, os.Interrupt, syscall.SIGTERM)
 
+	systemPrompt := *system
+	if *enableTools {
+		if suffix := toolRegistry.SystemPromptSuffix(); suffix != "" {
+			systemPrompt += "\n" + suffix
+		}
+	}
+
 	if *message != "" {
-		runSingleMessage(model, ctx, interruptCh)
+		runSingleMessage(model, ctx, interruptCh, toolRegistry, systemPrompt)
 	} else if *useTUI && term.IsTerminal(int(os.Stdout.Fd())) && term.IsTerminal(int(os.Stdin.Fd())) {
-		runTUI(model, ctx)
+		runTUI(model, ctx, toolRegistry, systemPrompt)
 	} else {
-		runPlainInteractive(model, ctx, interruptCh)
+		runPlainInteractive(model, ctx, interruptCh, toolRegistry, systemPrompt)
 	}
 }
 
@@ -107,20 +121,20 @@ func chatOptions() llama.ChatOptions {
 	return opts
 }
 
-func runSingleMessage(model *llama.Model, ctx *llama.Context, interruptCh <-chan os.Signal) {
+func runSingleMessage(model *llama.Model, ctx *llama.Context, interruptCh <-chan os.Signal, registry *llmtools.Registry, sysPrompt string) {
 	messages := []llama.ChatMessage{
-		{Role: "system", Content: *system},
+		{Role: "system", Content: sysPrompt},
 		{Role: "user", Content: *message},
 	}
 	llmcli.PrintSystemPrompt(*system)
 	llmcli.PrintUserInput(*message)
 
-	respond(ctx, messages, interruptCh)
+	respond(ctx, messages, interruptCh, registry)
 }
 
-func runTUI(model *llama.Model, ctx *llama.Context) {
+func runTUI(model *llama.Model, ctx *llama.Context, registry *llmtools.Registry, sysPrompt string) {
 	cfg := tui.Config{
-		SystemPrompt: *system,
+		SystemPrompt: sysPrompt,
 		MaxTokens:    *maxTokens,
 		Temperature:  float32(*temp),
 		TopP:         float32(*topP),
@@ -133,6 +147,7 @@ func runTUI(model *llama.Model, ctx *llama.Context) {
 		GPULayers:    *gpuLayers,
 		LoraPath:     *loraPath,
 		LoraScale:    float32(*loraScale),
+		ToolRegistry: registry,
 	}
 	p := tea.NewProgram(tui.New(model, ctx, cfg), tea.WithAltScreen(), tea.WithMouseCellMotion())
 	if _, err := p.Run(); err != nil {
@@ -141,7 +156,7 @@ func runTUI(model *llama.Model, ctx *llama.Context) {
 	fmt.Println()
 }
 
-func runPlainInteractive(model *llama.Model, ctx *llama.Context, interruptCh <-chan os.Signal) {
+func runPlainInteractive(model *llama.Model, ctx *llama.Context, interruptCh <-chan os.Signal, registry *llmtools.Registry, sysPrompt string) {
 	llmcli.PrintBanner("Интерактивный режим")
 	llmcli.PrintSystemPrompt(*system)
 	fmt.Printf("Параметры: max_tokens=%d, temperature=%.2f, top_p=%.2f, top_k=%d, ngl=%d, threads=%d",
@@ -150,10 +165,13 @@ func runPlainInteractive(model *llama.Model, ctx *llama.Context, interruptCh <-c
 		fmt.Printf(", lora=%s (scale %.2f)", *loraPath, *loraScale)
 	}
 	fmt.Println()
+	if *enableTools {
+		fmt.Println("Инструменты: get_weather")
+	}
 	fmt.Println("Введите сообщение. Пустая строка, 'exit'/'quit' или Ctrl-C — выход.")
 
 	messages := []llama.ChatMessage{
-		{Role: "system", Content: *system},
+		{Role: "system", Content: sysPrompt},
 	}
 
 	scanner := bufio.NewScanner(os.Stdin)
@@ -186,7 +204,7 @@ func runPlainInteractive(model *llama.Model, ctx *llama.Context, interruptCh <-c
 			}
 		}
 
-		content := respond(ctx, messages, interruptCh)
+		content := respond(ctx, messages, interruptCh, registry)
 		messages = append(messages, llama.ChatMessage{Role: "assistant", Content: content})
 	}
 }
@@ -200,7 +218,9 @@ func isExitCommand(s string) bool {
 }
 
 // respond генерирует ответ и возвращает контент для истории диалога.
-func respond(ctx *llama.Context, messages []llama.ChatMessage, interruptCh <-chan os.Signal) string {
+// Если модель вызывает инструменты, выполняет их и запрашивает финальный ответ.
+func respond(ctx *llama.Context, messages []llama.ChatMessage, interruptCh <-chan os.Signal, registry *llmtools.Registry) string {
+	const maxToolRounds = 5
 	genCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	if *timeout > 0 {
@@ -209,21 +229,59 @@ func respond(ctx *llama.Context, messages []llama.ChatMessage, interruptCh <-cha
 		defer c()
 	}
 
-	renderer := llmcli.NewStreamRenderer(os.Stdout)
-	renderer.WithExtraction(*reasoning, *reasoning)
-	llmcli.PrintAssistantHeader()
+	currentMessages := make([]llama.ChatMessage, len(messages))
+	copy(currentMessages, messages)
 
-	if *streaming {
-		return streamResponse(genCtx, ctx, messages, renderer, interruptCh, cancel)
+	for round := 0; round < maxToolRounds; round++ {
+		renderer := llmcli.NewStreamRenderer(os.Stdout)
+		renderer.WithExtraction(*reasoning, *reasoning)
+		llmcli.PrintAssistantHeader()
+
+		var content string
+		if *streaming {
+			content = streamResponse(genCtx, ctx, currentMessages, renderer, interruptCh, cancel)
+		} else {
+			response, err := ctx.Chat(genCtx, currentMessages, chatOptions())
+			if err != nil {
+				renderer.HandleError(err)
+				return ""
+			}
+			renderer.ProcessDelta(llama.ChatDelta{Content: response.Content})
+			content = renderer.Finish()
+		}
+
+		if registry == nil || !llmtools.IsToolCallResponse(content) {
+			return content
+		}
+
+		calls := llmtools.ParseToolCalls(content)
+		if len(calls) == 0 {
+			return content
+		}
+
+		nonToolContent := llmtools.ExtractNonToolContent(content)
+		if nonToolContent != "" {
+			fmt.Printf("%s%s%s\n", "\033[2m", nonToolContent, "\033[0m")
+		}
+
+		currentMessages = append(currentMessages, llama.ChatMessage{Role: "assistant", Content: content})
+
+		for _, call := range calls {
+			fmt.Printf("\n%s[tool] %s(%v)%s\n", "\033[33m", call.Name, call.Arguments, "\033[0m")
+			result, err := registry.Invoke(call.Name, call.Arguments)
+			if err != nil {
+				fmt.Printf("%s[tool error] %v%s\n", "\033[31m", err, "\033[0m")
+				result = fmt.Sprintf("Error: %v", err)
+			} else {
+				fmt.Printf("%s[result] %s%s\n", "\033[32m", result, "\033[0m")
+			}
+			_, toolContent := llmtools.FormatToolMessage(call, result, err)
+			currentMessages = append(currentMessages, llama.ChatMessage{Role: "tool", Content: toolContent})
+		}
 	}
 
-	response, err := ctx.Chat(genCtx, messages, chatOptions())
-	if err != nil {
-		renderer.HandleError(err)
-		return ""
-	}
-	renderer.ProcessDelta(llama.ChatDelta{Content: response.Content})
-	return renderer.Finish()
+	fmt.Printf("\n%s(достигнут лимитtool calls)%s\n", "\033[33m", "\033[0m")
+	return ""
 }
 
 func streamResponse(genCtx context.Context, ctx *llama.Context, messages []llama.ChatMessage, renderer *llmcli.StreamRenderer, interruptCh <-chan os.Signal, cancel context.CancelFunc) string {
