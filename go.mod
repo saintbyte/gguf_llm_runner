@@ -1,12 +1,12 @@
 module github.com/saintbyte/gguf_llm_runner
 
-go 1.26.5
+go 1.27.0
 
 require (
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
-	github.com/tcpipuk/llama-go v0.0.0-20260720163946-9cd5256084b0
+	github.com/tcpipuk/llama-go v0.0.0-20260828174538-992bbf8cfdc7
 	golang.org/x/term v0.45.0
 )
 
