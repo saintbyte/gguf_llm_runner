@@ -1,13 +1,13 @@
 module github.com/saintbyte/gguf_llm_runner
 
-go 1.26.5
+go 1.27.2
 
 require (
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
-	github.com/tcpipuk/llama-go v0.0.0-20260720163946-9cd5256084b0
-	golang.org/x/term v0.45.0
+	github.com/tcpipuk/llama-go v0.0.0-20261009125821-3b6c89e75117
+	golang.org/x/term v0.46.0
 )
 
 require (
@@ -30,6 +30,6 @@ require (
 	github.com/muesli/termenv v0.16.0 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
-	golang.org/x/sys v0.47.0 // indirect
-	golang.org/x/text v0.29.0 // indirect
+	golang.org/x/sys v0.48.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 )
